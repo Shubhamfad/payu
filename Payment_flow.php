@@ -571,18 +571,17 @@ class Payment_flow extends CI_Controller
   public function PayU($data = array()){
 
     $this->load->model('Funder_model', 'Funder');
-    $this->config->load('payu');
     $pre_funding_details = $this->Funder->get_pre_funding_data_detail($data['funder_payment_id']);
 
     // Print data for debugging (optional)
     print_r($data);
 
     // Set the API endpoint URL
-    $apiEndpoint = $merchantKey = $this->config->item('payu_base_url');
+    $apiEndpoint = "https://secure.payu.in/_payment";
 
     // Set the merchant key and salt
-    $merchantKey = $this->config->item('payu_merchant_key');      //"ccdWW5";
-    $salt = $this->config->item('payu_merchant_key');
+    $merchantKey = "cdAKYv";
+    $salt = "oBtBqueZMlc5tsPaMVhGkqCfr5J6oxht";
 
     // Set the order details
     $amount = $data['fl_rew_count'] * $pre_funding_details['fl_funded_amount'];
@@ -590,7 +589,7 @@ class Payment_flow extends CI_Controller
     $firstName = $pre_funding_details['fname'].' '.$pre_funding_details['lname'];
     $email = $pre_funding_details['email'];
     $phone = $pre_funding_details['mobile'];
-    $txnId = "TXN" . time();
+    $txnId = 'TxnId_'.rand(10000,99999)."_". time();
     $surl = base_url()."payment_flow/response_payu_success/";
     $furl = base_url()."payment_flow/response_payu_fail/";
 
@@ -615,6 +614,10 @@ class Payment_flow extends CI_Controller
 
     // Generate the hash
     $params["hash"] = $this->generateHash($params, $salt);
+
+    //Store transaction id to database
+    $upd_data['fl_instamojo_payment_request_id'] = $txnId;
+    $this->Funder->update_pre_funding_data_by_id($pre_funding_details['fl_id'],$upd_data);
 
     // Generate the HTML form for submission
     $this->generatePaymentForm($apiEndpoint, $params);
@@ -651,45 +654,173 @@ class Payment_flow extends CI_Controller
   }
 
   public function response_payu_success(){
-    $Payu_Reaponce = $_POST;
-    $merchantSalt = "aJqPPCxiB2QQ5YTuj79PekTbtYvg7UeG"; // Use config value
 
-    $hashSequence = $merchantSalt . '|' . $response['status'] . '||||||||||' .
-        $response['udf5'] . '|' . $response['udf4'] . '|' . $response['udf3'] . '|' .
-        $response['udf2'] . '|' . $response['udf1'] . '|' . $response['email'] . '|' .
-        $response['firstname'] . '|' . $response['productinfo'] . '|' .
-        $response['amount'] . '|' . $response['txnid'] . '|' . $response['key'];
-
-    $computedHash = strtolower(hash('sha512', $hashSequence));
-
-    if ($computedHash !== $response['hash']) {
-        // Log error, redirect to failure
-        redirect('payment/failed');
-        return;
-    }
-
-    // Validate transaction details (e.g., check txnId and amount in your database)
     $this->load->model('Funder_model', 'Funder');
-    $isValid = $this->Funder->validate_transaction($response['txnid'], $response['amount']);
+    $Payu_Response = $this->input->post();
 
-    if (!$isValid) {
-        redirect('payment/invalid');
-        return;
-    }
+    log_message('debug', '[PayU Success] Initial Response: ' . print_r($Payu_Response, true));
+    log_message('debug', '[PayU Success] Server Data: ' . print_r($_SERVER, true));
 
-    // Process successful payment
-    // Update database, send confirmation, etc.
-
-    redirect('payment/success'); // Redirect to a thank-you page
+    $salt = "oBtBqueZMlc5tsPaMVhGkqCfr5J6oxht"; 
+    $responseHash = $Payu_Response['hash'];
     
-    print_r($Payu_Reaponce);
-    print_r('pass');
+    $pre_funding_details = $this->Funder->get_pre_funding_data_by_request_id($Payu_Response['txnid']);
+    log_message('debug', '[PayU Success] Pre-Funding Details: ' . print_r($pre_funding_details, true));
+
+    if (empty($pre_funding_details)) {
+      log_message('error', "Invalid txnid: " . $Payu_Response['txnid']);
+      die('Invalid Transaction ID');
+    }
+    
+    $generatedHash = $this->generateResponseHash($Payu_Response, $salt);
+    log_message('debug', "[PayU Success] Hash Comparison - Received: $responseHash | Generated: $generatedHash");
+    
+    if($responseHash === $generatedHash) {
+
+      $data = [
+        'fpi_card_type' => $pre_funding_details['fl_card_type'],
+        'fpi_amount_funded' => $Payu_Response['amount'],
+        'fpi_payment_id' => $Payu_Response['mihpayid'],
+        'fpi_payment_mode' => $Payu_Response['mode'],
+        'fpi_transaction_status' => 1,
+        'fpi_merchant_id' => $pre_funding_details['fl_project_id'],
+        'fpi_email' => $Payu_Response['email'],
+        'fpi_mobile' => $Payu_Response['phone'],
+        'fpi_user_id' => $pre_funding_details['fl_funder_unique_user_id'],
+        'fpi_project_id' => $pre_funding_details['fl_project_id'],
+        'fpi_receipt_pdf_link' => '',
+        'device_info' => json_encode($_SERVER),
+        'fpi_hash_payu' => substr($this->getToken(),0,-8).'-'.substr($this->getToken(),0,-8).'-'.substr($this->getToken(),0,-8),
+        'fpi_transaction_id_gen' => $pre_funding_details['fl_id'],
+        'fpi_matching_partner_amount' => 0
+      ];
+      
+      log_message('debug', '[PayU Success] Prepared Data: ' . print_r($data, true));
+
+      // Check for duplicate payment
+      $value = $this->Funder->payment_id_duplicate_check($Payu_Response['mihpayid']);
+      log_message('debug', '[PayU Success] Duplicate Check Result: ' . print_r($value, true));
+
+      if ($value['result_count'] == 0) {
+        log_message('debug', '[PayU Success] Attempting DB Insert');
+        $this->Funder->add_confirmed_funding_details_rzp($data);
+      }
+      
+      $this->db->update('fad_funders_list', ['fl_payment_confirmation' => 1], ['fl_id' => $pre_funding_details['fl_id']]);
+      
+      $data['reward_details'] = $this->get_claimed_rewards_rz($pre_funding_details['fl_id']);
+      $rew_quantity = ( !empty($data['reward_details']['fl_rew_count']) ? $data['reward_details']['fl_rew_count'] : 0 );
+      $reward_id = ( !empty($data['reward_details']['fl_reward_id']) ? $data['reward_details']['fl_reward_id'] : 0 );
+
+      if($reward_id)
+      {
+        if($rew_quantity >= 1)
+        {
+          $last_claimed_user_id = $data['reward_details']['fl_funder_unique_user_id'];
+          $rew_details = $this->Funder->get_reward_details_rewardwise($reward_id);
+          if($rew_details['applicable_person'] >= $rew_details['claimed_reward'])
+          {
+            $up_arr  = array(
+              'claimed_reward' => $rew_details['claimed_reward']+$rew_quantity,
+              'last_claimed_user_id' => $last_claimed_user_id 
+            );                
+            
+            $res_rew = $this->Funder->update_rewards_data_by_id($reward_id,$up_arr);
+          }
+        }
+      }
+      redirect('payment_flow/razorpay_payment_confirmation/' . $pre_funding_details['fl_project_id']);
+    }
+    else {
+      die('Hash Mismatch - Possible Tampering Detected');
+    }
+   
   }
 
-  public function response_payu_fail(){
-    $Payu_Reaponce = $_POST;
-    print_r($Payu_Reaponce);
-    print_r('Fail');
+  public function response_payu_fail() {
+
+    $this->load->model('Funder_model', 'Funder');
+    $Payu_Response = $this->input->post();
+    $salt = "oBtBqueZMlc5tsPaMVhGkqCfr5J6oxht"; 
+    $responseHash = $Payu_Response['hash'];
+
+    log_message('debug', 'Raw PayU POST: ' . print_r($Payu_Response, true));
+
+    // Validate required keys in Payu_Response
+    $requiredKeys = ['mihpayid', 'txnid', 'amount', 'mode', 'email', 'phone'];
+    foreach ($requiredKeys as $key) {
+        if (!isset($Payu_Response[$key])) {
+          log_message('error', "Missing key: $key");
+          die("Invalid Payment Response");
+        }
+    }
+
+    $pre_funding_details = $this->Funder->get_pre_funding_data_by_request_id($Payu_Response['txnid']);
+    //print_r($pre_funding_details);
+    if (empty($pre_funding_details)) {
+      log_message('error', "Invalid txnid: " . $Payu_Response['txnid']);
+      die('Invalid Transaction ID');
+    }
+
+    $generatedHash = $this->generateResponseHash($Payu_Response, $salt);
+    if ($responseHash === $generatedHash) {
+        // Prepare data
+        $data = [
+            'fpi_card_type' => $pre_funding_details['fl_card_type'],
+            'fpi_amount_funded' => $pre_funding_details['fl_funded_amount'],
+            'fpi_payment_id' => $Payu_Response['mihpayid'],
+            'fpi_payment_mode' => $Payu_Response['mode'],
+            'fpi_transaction_status' => 0,
+            'fpi_merchant_id' => $pre_funding_details['fl_project_id'],
+            'fpi_email' => $Payu_Response['email'],
+            'fpi_mobile' => $Payu_Response['phone'],
+            'fpi_user_id' => $pre_funding_details['fl_funder_unique_user_id'],
+            'fpi_project_id' => $pre_funding_details['fl_project_id'],
+            'fpi_receipt_pdf_link' => '',
+            'device_info' => json_encode($_SERVER),
+            'fpi_hash_payu' => substr($this->getToken(),0,-8).'-'.substr($this->getToken(),0,-8).'-'.substr($this->getToken(),0,-8),
+            'fpi_transaction_id_gen' => $pre_funding_details['fl_id'],
+            'fpi_matching_partner_amount' => 0
+        ];
+       
+        log_message('debug', 'Final Data: ' . print_r($data, true));
+        // Check for duplicate payment
+        $value = $this->Funder->payment_id_duplicate_check($Payu_Response['mihpayid']);
+
+        log_message('info', "value for payment_id_duplicate_check: " . $value['result_count']);
+
+        if ($value['result_count'] == 0) {
+          $this->Funder->add_confirmed_funding_details_rzp($data);
+          log_message('info', "Data stored for mihpayid: " . $Payu_Response['mihpayid']);
+        }
+
+        // Redirect without output
+        redirect('Error/rejected/' . $pre_funding_details['fl_project_id']);
+        exit; // Ensure no further execution
+    } else {
+        log_message('error', 'Hash Mismatch - Possible Tampering Detected');
+        die('Hash Mismatch - Possible Tampering Detected');
+    }    
+  }
+
+  private function generateResponseHash($response, $salt){
+    // Create the hash string in reverse order
+    $hashString = $salt . "|" .
+                  $response["status"] . "||||||" .  // Add 5 empty pipes
+                  ($response["udf5"] ?? "") . "|" .  // Use null coalescing for optional fields
+                  ($response["udf4"] ?? "") . "|" .
+                  ($response["udf3"] ?? "") . "|" .
+                  ($response["udf2"] ?? "") . "|" .
+                  ($response["udf1"] ?? "") . "|" .
+                  $response["email"] . "|" .
+                  $response["firstname"] . "|" .
+                  $response["productinfo"] . "|" .
+                  $response["amount"] . "|" .
+                  $response["txnid"] . "|" .
+                  $response["key"];
+
+    return strtolower(hash("sha512", $hashString));
+    return strtolower(hash("sha512", $hashString));
   }
 
   public function Razerpay($data = array()){
@@ -1676,7 +1807,7 @@ curl_setopt($curl, CURLOPT_HTTPHEADER, array(
     require_once APPPATH."third_party/paytmlib/lib/config_paytm.php";
     require_once APPPATH."third_party/paytmlib/lib/encdec_paytm.php";
 
-// echo '<pre>'; print_r($data); die();
+    // echo '<pre>'; print_r($data); die();
 
     $paytmData = array(
     'CUST_ID' => $data['fl_project_id']."_".date("md").date("His"),
